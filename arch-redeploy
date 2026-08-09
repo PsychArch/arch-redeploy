@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+RA_PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+export RA_PROJECT_ROOT
+
+# shellcheck source=lib/common.sh
+source "$RA_PROJECT_ROOT/lib/common.sh"
+# shellcheck source=lib/stages.sh
+source "$RA_PROJECT_ROOT/lib/stages.sh"
+# shellcheck source=lib/detect.sh
+source "$RA_PROJECT_ROOT/lib/detect.sh"
+# shellcheck source=lib/mirrors.sh
+source "$RA_PROJECT_ROOT/lib/mirrors.sh"
+# shellcheck source=lib/build.sh
+source "$RA_PROJECT_ROOT/lib/build.sh"
+# shellcheck source=lib/boot.sh
+source "$RA_PROJECT_ROOT/lib/boot.sh"
+
+usage() {
+    cat <<EOF
+Usage: ./arch-redeploy [COMMAND]
+
+Run operational commands as root, for example with sudo or doas.
+
+Without a command, arch-redeploy starts or resumes the guided redeploy.
+
+Commands:
+  status    Show the complete timeline and the captured redeploy plan
+  cancel    Restore the source boot state and remove owned preparation files
+  help      Show this help
+
+The source disk remains unchanged through recovery validation. The timeline
+marks the exact point after which returning to the source system is impossible.
+EOF
+}
+
+ra_plan_fingerprint() {
+    jq -Sc '{protocol,install_id,host,disk,boot,identity,admin,network,mirrors}' \
+        "$RA_STATE_FILE" |
+        sha256sum | awk '{print $1}'
+}
+
+ra_prepared_fingerprint() {
+    jq -Sc \
+        '{protocol,install_id,host,disk,boot,identity,admin,network,mirrors,payload,artifacts}' \
+        "$RA_STATE_FILE" | sha256sum | awk '{print $1}'
+}
+
+ra_revalidate_prepared_fingerprint() {
+    local expected actual
+    expected=$(jq -r '.progress.prepared_fingerprint // empty' "$RA_STATE_FILE")
+    actual=$(ra_prepared_fingerprint)
+    if [[ -n $expected ]]; then
+        [[ $actual == "$expected" ]] ||
+            ra_die "the prepared redeploy plan changed outside the guided workflow"
+    else
+        # Legacy prepared state is sealed on its first guided resume.
+        # shellcheck disable=SC2016
+        ra_state_update '.progress.prepared_fingerprint = $fingerprint' \
+            --arg fingerprint "$actual"
+    fi
+}
+
+start_preparation() {
+    local disk disk_json admin network mirrors boot_mode identity host virtual package_manager install_id
+    local detected_hostname created_at fingerprint
+    ra_render_timeline inspect
+    echo
+    ra_ensure_host_dependencies || ra_die "install the listed prerequisites before continuing"
+    ra_preflight_host
+    ra_preflight_source_return_hook
+    ra_preflight_boot_scheduler
+    disk=$(ra_select_target_disk)
+    ra_validate_boot_storage_target "$disk"
+    disk_json=$(ra_disk_identity "$disk")
+    [[ $(jq -r .size <<<"$disk_json") -ge 8589934592 ]] ||
+        ra_die "target disk must be at least 8 GiB"
+
+    admin=$(ra_review_admin "$(ra_detect_admin)")
+    network=$(ra_capture_network)
+    jq -e '(.ipv4.mode != "none") or (.ipv6.mode != "none")' <<<"$network" >/dev/null ||
+        ra_die "no usable default-route network configuration was detected"
+    mirrors=$(ra_choose_mirrors)
+    boot_mode=$(ra_boot_mode)
+    detected_hostname=$(hostnamectl --static 2>/dev/null || hostname)
+    [[ $detected_hostname =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] ||
+        ra_die "the detected hostname is not valid for the target: $detected_hostname"
+    identity=$(jq -n --arg hostname "$detected_hostname" \
+        --arg timezone "$(ra_detect_timezone)" '{hostname:$hostname, timezone:$timezone}')
+    virtual=false
+    ra_is_virtual_machine && virtual=true
+    package_manager=$(ra_package_manager)
+    install_id=$(cat /proc/sys/kernel/random/uuid)
+    host=$(jq -n --arg package_manager "$package_manager" --argjson virtual "$virtual" \
+        '{package_manager:$package_manager, virtual:$virtual}')
+    created_at=$(date -u +%FT%TZ)
+    fingerprint=pending
+
+    mkdir -p "$RA_STATE_DIR"
+    chmod 0700 "$RA_STATE_DIR"
+    jq -n \
+        --arg version "$RA_VERSION" \
+        --arg protocol "$RA_PROTOCOL_VERSION" \
+        --arg install_id "$install_id" \
+        --arg created_at "$created_at" \
+        --arg fingerprint "$fingerprint" \
+        --argjson host "$host" \
+        --argjson disk "$disk_json" \
+        --arg boot_mode "$boot_mode" \
+        --argjson identity "$identity" \
+        --argjson admin "$admin" \
+        --argjson network "$network" \
+        --argjson mirrors "$mirrors" '
+        {
+          project_version:$version,
+          protocol:$protocol,
+          install_id:$install_id,
+          state:"preparing",
+          created_at:$created_at,
+          host:$host,
+          disk:$disk,
+          boot:{mode:$boot_mode},
+          identity:$identity,
+          admin:$admin,
+          network:$network,
+          mirrors:$mirrors,
+          payload:{mode:"undecided", packages:[]},
+          progress:{
+            current:"build",
+            started_at:$created_at,
+            updated_at:$created_at,
+            input_fingerprint:$fingerprint,
+            completed:{inspect:$created_at}
+          }
+        }' | ra_atomic_json "$RA_STATE_FILE"
+    fingerprint=$(ra_plan_fingerprint)
+    # shellcheck disable=SC2016
+    ra_state_update '.progress.input_fingerprint = $fingerprint' --arg fingerprint "$fingerprint" ||
+        ra_die "could not commit the captured-plan fingerprint"
+    build_preparation
+}
+
+ra_revalidate_preparation_inputs() {
+    local mirror expected_fingerprint actual_fingerprint
+    expected_fingerprint=$(jq -r '.progress.input_fingerprint // empty' "$RA_STATE_FILE")
+    actual_fingerprint=$(ra_plan_fingerprint)
+    if [[ -n $expected_fingerprint && $expected_fingerprint != pending ]]; then
+        [[ $actual_fingerprint == "$expected_fingerprint" ]] ||
+            ra_die "the captured redeploy plan changed outside the guided workflow"
+    else
+        # shellcheck disable=SC2016
+        ra_state_update '.progress.input_fingerprint = $fingerprint' \
+            --arg fingerprint "$actual_fingerprint"
+    fi
+    ra_validate_disk_identity "$(jq -c .disk "$RA_STATE_FILE")" ||
+        ra_die "the target disk changed; cancel before creating a new plan"
+    ra_validate_mirror_base alpine "$(ra_state_get .mirrors.alpine)" ||
+        ra_die "the selected Alpine release mirror is no longer accessible"
+    while IFS= read -r mirror; do
+        ra_validate_mirror_base arch "$mirror" ||
+            ra_die "an Arch mirror is no longer accessible: $mirror"
+    done < <(jq -r '.mirrors.arch[]' "$RA_STATE_FILE")
+}
+
+build_preparation() {
+    ra_render_timeline build
+    echo
+    ra_revalidate_preparation_inputs
+    if ra_finalize_prepared_artifacts; then
+        ra_info "reused the previously verified installer artifacts"
+    else
+        ra_build_installer
+    fi
+    ra_revalidate_prepared_fingerprint
+    ra_progress_set review || ra_die "could not record completed preparation"
+}
+
+show_status() {
+    local current mode disk drift kernel_size initramfs_size one_shot
+    current=$(ra_progress_current)
+    ra_render_timeline "$current"
+    echo
+    if ! ra_state_exists; then
+        echo "No redeploy operation is currently prepared."
+        return
+    fi
+    mode=$(jq -r '.payload.mode // "undecided"' "$RA_STATE_FILE")
+    disk=$(ra_state_get .disk.path)
+    if ra_validate_disk_identity "$(jq -c .disk "$RA_STATE_FILE")"; then
+        drift=none
+    else
+        drift='CHANGED - continuation is blocked'
+    fi
+    kernel_size=$(jq -r '.artifacts.kernel_bytes // 0' "$RA_STATE_FILE")
+    initramfs_size=$(jq -r '.artifacts.initramfs_bytes // 0' "$RA_STATE_FILE")
+    one_shot=$(jq -r 'if (.state // "") == "scheduled" then "armed" else "not armed" end' \
+        "$RA_STATE_FILE")
+    cat <<EOF
+Install ID:        $(ra_state_get .install_id)
+Target disk:       $disk ($(ra_human_bytes "$(ra_state_get .disk.size)"))
+Disk drift:        $drift
+One-shot boot:     $one_shot
+Disk erasure:      not started
+Boot mode:         $(ra_state_get .boot.mode)
+Payload mode:      $mode
+Required RAM:      $(ra_human_bytes "$(jq -r '.payload.boot_memory_required // 0' "$RA_STATE_FILE")")
+Required disk:     $(ra_human_bytes "$(jq -r '.payload.disk_bytes_required // 0' "$RA_STATE_FILE")")
+Kernel:            $(ra_human_bytes "$kernel_size")
+Installer image:   $(ra_human_bytes "$initramfs_size")
+Admin user:        $(ra_state_get .admin.user)
+SSH port:          $(ra_state_get .admin.port)
+Hostname/timezone: $(ra_state_get .identity.hostname) / $(ra_state_get .identity.timezone)
+Alpine mirror:     $(ra_state_get .mirrors.alpine)
+Arch mirrors:
+$(jq -r '.mirrors.arch[] | "  - " + .' "$RA_STATE_FILE")
+EOF
+    if [[ $mode == online ]]; then
+        ra_warn "ONLINE AFTER WIPE: the locked packages still require network access"
+    fi
+}
+
+review_and_arm() {
+    local disk mode confirmation expected
+    ra_revalidate_preparation_inputs
+    ra_revalidate_prepared_fingerprint
+    ra_verify_artifacts
+    ra_validate_disk_identity "$(jq -c .disk "$RA_STATE_FILE")" ||
+        ra_die "the target disk changed; cancel before creating a new plan"
+    show_status
+    echo
+    if ! ra_confirm "Continue and arm the one-shot redeploy boot?"; then
+        echo "Paused safely. Run sudo ./arch-redeploy to return to this review."
+        return
+    fi
+    disk=$(ra_state_get .disk.path)
+    mode=$(ra_state_get .payload.mode)
+    expected="REDEPLOY $disk"
+    [[ $mode == online ]] && expected="$expected WITH NETWORK"
+    read -r -p "Type $expected to confirm: " confirmation
+    [[ $confirmation == "$expected" ]] || ra_die "confirmation did not match"
+    ra_schedule_boot
+    handle_armed_state
+}
+
+ra_reboot_system() {
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
+        systemctl reboot
+    else
+        reboot
+    fi
+}
+
+handle_armed_state() {
+    if ! ra_schedule_is_armed; then
+        ra_warn "the recorded one-shot boot is no longer armed; restoring the source state"
+        cancel_owned_state
+        echo "The source boot state was restored. Run sudo ./arch-redeploy to start again."
+        return
+    fi
+    show_status
+    echo
+    if ra_confirm "Reboot into the verified recovery environment now?"; then
+        ra_reboot_system
+    else
+        echo "The next reboot enters recovery. Run sudo ./arch-redeploy cancel before reboot to abort."
+    fi
+}
+
+cancel_owned_state() {
+    local state_dir=$RA_STATE_DIR
+    ra_unschedule_boot
+    ra_remove_source_return_hook
+    [[ $state_dir == */arch-redeploy ]] || ra_die "refusing an unsafe state cleanup path"
+    rm -rf "$state_dir"
+}
+
+cancel_state() {
+    if ! ra_state_exists; then
+        echo "Nothing is prepared or armed."
+        return
+    fi
+    show_status
+    echo
+    ra_confirm "Restore the source boot state and remove all arch-redeploy files?" ||
+        ra_die "cancellation aborted"
+    cancel_owned_state
+    echo "The source boot state was restored and owned preparation files were removed."
+}
+
+reconcile_pending_schedule() {
+    local kind hook
+    kind=$(jq -r '.schedule.kind // "none"' "$RA_STATE_FILE")
+    hook=$(jq -r '.return_hook.kind // "none"' "$RA_STATE_FILE")
+    if [[ $kind != none ]]; then
+        ra_warn "rolling back an incomplete one-shot boot transaction"
+        ra_unschedule_boot
+    fi
+    if [[ $hook != none ]]; then
+        ra_warn "removing an incomplete source-return hook"
+        ra_remove_source_return_hook
+    fi
+}
+
+guided_run() {
+    local state protocol
+    if ! ra_state_exists; then
+        start_preparation
+        review_and_arm
+        return
+    fi
+    protocol=$(jq -r '.protocol // empty' "$RA_STATE_FILE")
+    [[ $protocol == "$RA_PROTOCOL_VERSION" ]] ||
+        ra_die "the saved operation uses an incompatible protocol; use cancel to restore owned changes"
+    state=$(jq -r '.state // empty' "$RA_STATE_FILE")
+    case $state in
+        preparing)
+            reconcile_pending_schedule
+            build_preparation
+            review_and_arm
+            ;;
+        prepared)
+            reconcile_pending_schedule
+            if [[ $(ra_progress_current) != review ]]; then
+                ra_progress_set review || ra_die "invalid saved progress"
+            fi
+            review_and_arm
+            ;;
+        scheduled) handle_armed_state ;;
+        *) ra_die "unrecognized saved operation state; use cancel to restore owned changes" ;;
+    esac
+}
+
+main() {
+    local command
+    (($# <= 1)) || { usage >&2; return 2; }
+    if (($# == 0)); then
+        ra_require_root
+        ra_acquire_lock
+        guided_run
+        return
+    fi
+    command=$1
+    case "$command" in
+        help|-h|--help) usage ;;
+        status|cancel)
+            ra_require_root
+            ra_acquire_lock
+            case "$command" in
+                status) show_status ;;
+                cancel) cancel_state ;;
+            esac
+            ;;
+        prepare|schedule)
+            ra_error "stage commands were removed; run sudo ./arch-redeploy"
+            return 2
+            ;;
+        *) usage >&2; return 2 ;;
+    esac
+}
+
+main "$@"

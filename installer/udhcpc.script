@@ -1,0 +1,54 @@
+#!/bin/sh
+
+resolv_conf=${RESOLV_CONF:-/etc/resolv.conf}
+
+case "$1" in
+    deconfig)
+        ip address flush dev "$interface" scope global
+        ;;
+    bound|renew)
+        prefix=${mask:-${subnet:-24}}
+        if [ "${prefix#*.}" != "$prefix" ]; then
+            old_ifs=$IFS
+            IFS=.
+            set -- $prefix
+            IFS=$old_ifs
+            [ "$#" -eq 4 ] || exit 1
+            prefix=0
+            mask_tail=0
+            for octet in "$@"; do
+                case "$octet" in
+                    255)
+                        [ "$mask_tail" -eq 0 ] || exit 1
+                        prefix=$((prefix + 8))
+                        ;;
+                    254|252|248|240|224|192|128)
+                        [ "$mask_tail" -eq 0 ] || exit 1
+                        case "$octet" in
+                            254) prefix=$((prefix + 7)) ;;
+                            252) prefix=$((prefix + 6)) ;;
+                            248) prefix=$((prefix + 5)) ;;
+                            240) prefix=$((prefix + 4)) ;;
+                            224) prefix=$((prefix + 3)) ;;
+                            192) prefix=$((prefix + 2)) ;;
+                            128) prefix=$((prefix + 1)) ;;
+                        esac
+                        mask_tail=1
+                        ;;
+                    0) mask_tail=1 ;;
+                    *) exit 1 ;;
+                esac
+            done
+        fi
+        ip address replace "$ip/$prefix" dev "$interface"
+        if [ -n "${router:-}" ]; then
+            ip route replace default via "${router%% *}" dev "$interface" onlink
+        fi
+        : >"$resolv_conf"
+        for server in ${dns:-}; do
+            printf 'nameserver %s\n' "$server" >>"$resolv_conf"
+        done
+        ;;
+esac
+
+exit 0

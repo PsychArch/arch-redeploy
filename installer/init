@@ -1,0 +1,34 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export TERM=${TERM:-linux}
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+if [[ -d /sys/firmware/efi ]]; then
+    mkdir -p /sys/firmware/efi/efivars
+    mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null ||
+        echo "warning: UEFI variables are unavailable; removable-media boot fallback will be used"
+fi
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs dev /dev
+mkdir -p /dev/pts /run /tmp
+mount -t devpts devpts /dev/pts
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+
+hostname arch-redeploy
+depmod -a 2>/dev/null || true
+for module in virtio_pci virtio_blk virtio_scsi virtio_net nvme ahci ata_piix \
+    xen_blkfront xen_netfront hv_storvsc hv_netvsc ena vmxnet3 e1000 e1000e \
+    ext4 vfat ipv6; do
+    modprobe "$module" 2>/dev/null || true
+done
+mdev -s
+ln -snf /proc/self/fd /dev/fd
+ln -snf /proc/self/fd/0 /dev/stdin
+ln -snf /proc/self/fd/1 /dev/stdout
+ln -snf /proc/self/fd/2 /dev/stderr
+
+exec /usr/local/lib/arch-redeploy/install.sh

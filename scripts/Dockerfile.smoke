@@ -1,0 +1,21 @@
+FROM alpine:3.24
+
+RUN apk add --no-cache \
+    bash \
+    coreutils \
+    cpio \
+    curl \
+    findutils \
+    gawk \
+    gnupg \
+    grep \
+    gzip \
+    jq \
+    pacman \
+    sed \
+    tar \
+    util-linux \
+    util-linux-misc \
+    zstd
+
+ENTRYPOINT ["/project/scripts/smoke-builder.sh"]

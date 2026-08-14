@@ -178,7 +178,7 @@ build_preparation() {
 }
 
 show_status() {
-    local current mode disk drift kernel_size initramfs_size one_shot
+    local current mode disk drift kernel_size initramfs_size payload_size one_shot
     current=$(ra_progress_current)
     ra_render_timeline "$current"
     echo
@@ -195,6 +195,7 @@ show_status() {
     fi
     kernel_size=$(jq -r '.artifacts.kernel_bytes // 0' "$RA_STATE_FILE")
     initramfs_size=$(jq -r '.artifacts.initramfs_bytes // 0' "$RA_STATE_FILE")
+    payload_size=$(jq -r '.artifacts.rootfs_bytes // 0' "$RA_STATE_FILE")
     one_shot=$(jq -r 'if (.state // "") == "scheduled" then "armed" else "not armed" end' \
         "$RA_STATE_FILE")
     cat <<EOF
@@ -209,6 +210,7 @@ Required RAM:      $(ra_human_bytes "$(jq -r '.payload.boot_memory_required // 0
 Required disk:     $(ra_human_bytes "$(jq -r '.payload.disk_bytes_required // 0' "$RA_STATE_FILE")")
 Kernel:            $(ra_human_bytes "$kernel_size")
 Installer image:   $(ra_human_bytes "$initramfs_size")
+Offline payload:   $(ra_human_bytes "$payload_size")
 Admin user:        $(ra_state_get .admin.user)
 SSH port:          $(ra_state_get .admin.port)
 Hostname/timezone: $(ra_state_get .identity.hostname) / $(ra_state_get .identity.timezone)

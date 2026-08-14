@@ -15,7 +15,7 @@ readonly RA_UEFI_GRUB_MODULES="part_gpt part_msdos fat ext2 xfs btrfs lvm diskfi
 readonly RA_UEFI_LOADER_MARGIN_BYTES=$((1024 * 1024))
 
 ra_verify_artifacts() {
-    local kernel initramfs
+    local kernel initramfs rootfs
     kernel="$RA_STATE_DIR/$(ra_state_get .artifacts.kernel)"
     initramfs="$RA_STATE_DIR/$(ra_state_get .artifacts.initramfs)"
     [[ -s $kernel && -s $initramfs ]] || ra_die "prepared boot artifacts are missing"
@@ -23,25 +23,32 @@ ra_verify_artifacts() {
         ra_die "prepared kernel checksum mismatch"
     [[ $(ra_sha256 "$initramfs") == "$(ra_state_get .artifacts.initramfs_sha256)" ]] ||
         ra_die "prepared initramfs checksum mismatch"
+    if [[ $(jq -r '.payload.mode // "online"' "$RA_STATE_FILE") == offline ]]; then
+        rootfs="$RA_STATE_DIR/$(ra_state_get .artifacts.rootfs)"
+        [[ -s $rootfs ]] || ra_die "prepared offline payload is missing"
+        [[ $(ra_sha256 "$rootfs") == "$(ra_state_get .artifacts.rootfs_sha256)" ]] ||
+            ra_die "prepared offline payload checksum mismatch"
+    fi
 }
 
 ra_verify_boot_capacity() {
-    local kernel=$1 initramfs=$2 required
-    required=$(ra_boot_capacity_required "$kernel" "$initramfs")
-    ra_boot_capacity_fits "$kernel" "$initramfs" ||
+    local kernel=$1 initramfs=$2 payload=${3:-} required
+    required=$(ra_boot_capacity_required "$kernel" "$initramfs" "$payload")
+    ra_boot_capacity_fits "$kernel" "$initramfs" "$payload" ||
         ra_die "the boot filesystem needs $(ra_human_bytes "$required") free for prepared artifacts"
 }
 
 ra_boot_capacity_required() {
-    local kernel=$1 initramfs=$2
-    printf '%s' "$(($(ra_bytes "$kernel") + $(ra_bytes "$initramfs") + 16 * 1024 * 1024))"
+    local kernel=$1 initramfs=$2 payload=${3:-} payload_bytes=0
+    [[ -z $payload ]] || payload_bytes=$(ra_bytes "$payload")
+    printf '%s' "$(($(ra_bytes "$kernel") + $(ra_bytes "$initramfs") + payload_bytes + 16 * 1024 * 1024))"
 }
 
 ra_boot_capacity_fits() {
-    local kernel=$1 initramfs=$2 parent available required
+    local kernel=$1 initramfs=$2 payload=${3:-} parent available required
     parent=$(dirname "$RA_BOOT_DIR")
     available=$(df -PB1 "$parent" | awk 'NR == 2 {print $4}')
-    required=$(ra_boot_capacity_required "$kernel" "$initramfs")
+    required=$(ra_boot_capacity_required "$kernel" "$initramfs" "$payload")
     ((available >= required))
 }
 
@@ -243,12 +250,15 @@ ra_grub_path() {
 }
 
 ra_stage_boot_files() {
-    local kernel initramfs install_id pending destination
+    local kernel initramfs rootfs='' install_id pending destination
     kernel="$RA_STATE_DIR/$(ra_state_get .artifacts.kernel)"
     initramfs="$RA_STATE_DIR/$(ra_state_get .artifacts.initramfs)"
+    if [[ $(jq -r '.payload.mode // "online"' "$RA_STATE_FILE") == offline ]]; then
+        rootfs="$RA_STATE_DIR/$(ra_state_get .artifacts.rootfs)"
+    fi
     install_id=$(ra_state_get .install_id)
     pending="${RA_BOOT_DIR}.pending-$install_id"
-    ra_verify_boot_capacity "$kernel" "$initramfs"
+    ra_verify_boot_capacity "$kernel" "$initramfs" "$rootfs"
     if [[ -e $RA_BOOT_DIR ]]; then
         if [[ -d $RA_BOOT_DIR && ! -e $RA_BOOT_DIR/install-id ]] &&
             [[ -z $(find "$RA_BOOT_DIR" -mindepth 1 -print -quit) ]]; then
@@ -273,11 +283,36 @@ ra_stage_boot_files() {
     chmod 0600 "$destination/install-id"
     install -m 0600 "$kernel" "$destination/vmlinuz"
     install -m 0600 "$initramfs" "$destination/initramfs.img"
+    if [[ -n $rootfs ]]; then
+        install -m 0600 "$rootfs" "$destination/rootfs.tar.zst"
+    else
+        rm -f "$destination/rootfs.tar.zst"
+    fi
     sync "$destination"
     if [[ $destination == "$pending" ]]; then
         mv -- "$pending" "$RA_BOOT_DIR"
         sync "$(dirname "$RA_BOOT_DIR")"
     fi
+}
+
+ra_payload_kernel_args() {
+    local payload_file mount_target fs_root uuid fs_type relative payload_path
+    [[ $(jq -r '.payload.mode // "online"' "$RA_STATE_FILE") == offline ]] || return 0
+    payload_file="$RA_BOOT_DIR/rootfs.tar.zst"
+    [[ -s $payload_file ]] || return 1
+    mount_target=$(findmnt -T "$payload_file" -rn -o TARGET) || return 1
+    fs_root=$(findmnt -T "$payload_file" -rn -o FSROOT) || return 1
+    uuid=$(findmnt -T "$payload_file" -rn -o UUID) || return 1
+    fs_type=$(findmnt -T "$payload_file" -rn -o FSTYPE) || return 1
+    [[ -n $mount_target && -n $fs_root && $uuid =~ ^[A-Za-z0-9-]+$ ]] || return 1
+    [[ $fs_type =~ ^(btrfs|ext2|ext3|ext4|vfat|xfs)$ ]] || return 1
+    relative=${payload_file#"$mount_target"}
+    [[ $relative == /* ]] || relative=/$relative
+    payload_path="${fs_root%/}$relative"
+    [[ $payload_path == /* && $payload_path != *..* &&
+        $payload_path =~ ^[/A-Za-z0-9@._+-]+$ ]] || return 1
+    printf ' arch_redeploy_payload_uuid=%s arch_redeploy_payload_fstype=%s arch_redeploy_payload_path=%s' \
+        "$uuid" "$fs_type" "$payload_path"
 }
 
 ra_file_sha256() {
@@ -480,11 +515,12 @@ ra_remove_source_return_hook() {
 }
 
 ra_write_grub_entry() {
-    local destination=$1 fs_uuid kernel_path initramfs_path
+    local destination=$1 fs_uuid kernel_path initramfs_path payload_args
     fs_uuid=$(findmnt -T "$RA_BOOT_DIR" -rn -o UUID)
     [[ -n $fs_uuid ]] || return 1
     kernel_path=$(ra_grub_path "$RA_BOOT_DIR/vmlinuz") || return 1
     initramfs_path=$(ra_grub_path "$RA_BOOT_DIR/initramfs.img") || return 1
+    payload_args=$(ra_payload_kernel_args) || return 1
     cat >"$destination" <<EOF
 $RA_BOOT_START
 set timeout=3
@@ -492,7 +528,7 @@ menuentry '$RA_GRUB_ENTRY' --unrestricted {
     insmod all_video
     search --no-floppy --fs-uuid --set=root $fs_uuid
     set btrfs_relative_path=n
-    linux $kernel_path console=tty0 console=ttyS0,115200n8
+    linux $kernel_path console=tty0 console=ttyS0,115200n8$payload_args
     initrd $initramfs_path
 }
 $RA_BOOT_END
@@ -719,6 +755,12 @@ ra_schedule_bios_grub() {
         ra_state_update 'del(.schedule)' || true
         return 1
     fi
+    if ! sync; then
+        ra_restore_grub_next_entry "$original_next"
+        ra_restore_scheduled_config "$cfg" "$backup" "$original_sha" "$scheduled_sha"
+        ra_state_update 'del(.schedule)' || true
+        return 1
+    fi
     if ! ra_state_update '.schedule.kind = "bios-grub"'; then
         ra_restore_grub_next_entry "$original_next"
         ra_restore_scheduled_config "$cfg" "$backup" "$original_sha" "$scheduled_sha"
@@ -728,7 +770,7 @@ ra_schedule_bios_grub() {
 }
 
 ra_schedule_bios_extlinux() {
-    local cfg extlinux_dir kernel_path initramfs_path adv rollback_dir config_backup adv_backup
+    local cfg extlinux_dir kernel_path initramfs_path payload_args adv rollback_dir config_backup adv_backup
     local original_sha scheduled_sha original_adv_sha scheduled_adv_sha
     cfg=$(find /boot -maxdepth 3 -type f -name extlinux.conf -print -quit 2>/dev/null)
     [[ -n $cfg ]] || return 1
@@ -746,6 +788,7 @@ ra_schedule_bios_extlinux() {
     original_adv_sha=$(ra_file_sha256 "$adv")
     kernel_path=$(ra_grub_path "$RA_BOOT_DIR/vmlinuz") || return 1
     initramfs_path=$(ra_grub_path "$RA_BOOT_DIR/initramfs.img") || return 1
+    payload_args=$(ra_payload_kernel_args) || return 1
     # shellcheck disable=SC2016
     ra_state_update '.schedule = {
         kind:"bios-extlinux-pending",
@@ -764,7 +807,7 @@ LABEL arch-redeploy
   MENU LABEL $RA_GRUB_ENTRY
   LINUX $kernel_path
   INITRD $initramfs_path
-  APPEND console=tty0 console=ttyS0,115200n8
+  APPEND console=tty0 console=ttyS0,115200n8$payload_args
 $RA_BOOT_END
 EOF
     then
@@ -785,6 +828,12 @@ EOF
         return 1
     fi
     if ! extlinux --once=arch-redeploy "$extlinux_dir"; then
+        cp -a --reflink=auto "$adv_backup" "$adv"
+        ra_restore_scheduled_config "$cfg" "$config_backup" "$original_sha" "$scheduled_sha"
+        ra_state_update 'del(.schedule)' || true
+        return 1
+    fi
+    if ! sync; then
         cp -a --reflink=auto "$adv_backup" "$adv"
         ra_restore_scheduled_config "$cfg" "$config_backup" "$original_sha" "$scheduled_sha"
         ra_state_update 'del(.schedule)' || true

@@ -13,6 +13,7 @@ readonly CURRENT_STAGE=/run/arch-redeploy-current-stage
 readonly CANCEL_REQUEST=/run/arch-redeploy-cancel
 readonly ERASE_STARTED=/run/arch-redeploy-erase-started
 readonly BOUNDARY_LOCK=/run/arch-redeploy-boundary.lock
+readonly RUNTIME_PAYLOAD=/run/arch-redeploy/rootfs.tar.zst
 readonly ABORT_COUNTDOWN_SECONDS=60
 
 # shellcheck source=installer/target.sh
@@ -240,7 +241,7 @@ start_installer_ssh() {
     if [[ -n $keys ]]; then
         printf '%s\n' "$keys" >/root/.ssh/authorized_keys
         chmod 0600 /root/.ssh/authorized_keys
-        usermod -p '!' root
+        usermod -p "$RA_KEY_ONLY_PASSWORD_HASH" root
     elif [[ -n $hash ]]; then
         usermod -p "$hash" root
     fi
@@ -263,6 +264,68 @@ EOF
     echo "Installer SSH is listening on port $port"
 }
 
+kernel_command_line_value() {
+    local key=$1 token
+    while IFS= read -r token; do
+        case $token in
+            "$key="*) printf '%s' "${token#*=}"; return 0 ;;
+        esac
+    done < <(tr ' ' '\n' </proc/cmdline)
+    return 1
+}
+
+offline_payload_archive() {
+    local candidate
+    for candidate in /opt/arch-redeploy/rootfs.tar.zst "$RUNTIME_PAYLOAD" \
+        "$RECOVERY_DIR/rootfs.tar.zst"; do
+        [[ -r $candidate ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+load_external_payload() {
+    local disk=$1 uuid fs_type payload_path device backing mount_options
+    local source expected_sha expected_bytes temporary mount_dir=/run/arch-redeploy-source
+    [[ $(jq -r .payload.mode "$CONFIG") == offline ]] || return 0
+    offline_payload_archive >/dev/null 2>&1 && return 0
+    uuid=$(kernel_command_line_value arch_redeploy_payload_uuid) || return 1
+    fs_type=$(kernel_command_line_value arch_redeploy_payload_fstype) || return 1
+    payload_path=$(kernel_command_line_value arch_redeploy_payload_path) || return 1
+    [[ $uuid =~ ^[A-Za-z0-9-]+$ ]] || return 1
+    [[ $fs_type =~ ^(btrfs|ext2|ext3|ext4|vfat|xfs)$ ]] || return 1
+    [[ $payload_path == /* && $payload_path != *..* &&
+        $payload_path =~ ^[/A-Za-z0-9@._+-]+$ ]] || return 1
+    device=$(blkid -U "$uuid") || return 1
+    [[ -b $device ]] || return 1
+    backing=$(lsblk -srnpo NAME,TYPE "$device" | awk '$2 == "disk" {print $1; exit}')
+    [[ -n $backing && $(readlink -f "$backing") == "$(readlink -f "$disk")" ]] || return 1
+    case $fs_type in
+        ext2|ext3|ext4) mount_options=ro,noload ;;
+        xfs) mount_options=ro,norecovery ;;
+        btrfs) mount_options=ro,subvolid=5 ;;
+        *) mount_options=ro ;;
+    esac
+    mkdir -p "$mount_dir" "$(dirname "$RUNTIME_PAYLOAD")"
+    mount -t "$fs_type" -o "$mount_options" "$device" "$mount_dir" || return 1
+    source="$mount_dir$payload_path"
+    expected_sha=$(jq -r .payload.rootfs_sha256 "$CONFIG")
+    expected_bytes=$(jq -r .payload.rootfs_bytes "$CONFIG")
+    temporary="$RUNTIME_PAYLOAD.part"
+    rm -f "$temporary"
+    if [[ ! -r $source ]] || [[ $(stat -c '%s' "$source") != "$expected_bytes" ]] ||
+        [[ $(sha256sum "$source" | awk '{print $1}') != "$expected_sha" ]] ||
+        ! install -m 0600 "$source" "$temporary"; then
+        rm -f "$temporary"
+        umount "$mount_dir" 2>/dev/null || true
+        return 1
+    fi
+    umount "$mount_dir" || { rm -f "$temporary"; return 1; }
+    [[ $(stat -c '%s' "$temporary") == "$expected_bytes" ]] || { rm -f "$temporary"; return 1; }
+    [[ $(sha256sum "$temporary" | awk '{print $1}') == "$expected_sha" ]] || { rm -f "$temporary"; return 1; }
+    mv -f "$temporary" "$RUNTIME_PAYLOAD"
+    echo "Verified offline payload copied into recovery RAM before disk erasure."
+}
+
 validate_config() {
     jq -e '
         .protocol == "2" and
@@ -275,6 +338,10 @@ validate_config() {
         (.admin.user | type == "string" and test("^[a-z_][a-z0-9_-]{0,31}$")) and
         (.admin.port | type == "number" and . >= 1 and . <= 65535) and
         (.payload.mode == "offline" or .payload.mode == "online") and
+        (if .payload.mode == "offline" then
+            (.payload.rootfs_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            (.payload.rootfs_bytes | type == "number" and . > 0)
+         else true end) and
         (.mirrors.arch | type == "array" and length >= 1) and
         (if .payload.mode == "online" then (.mirrors.arch | length >= 2) else true end) and
         ([.network.ipv4.mode, .network.ipv6.mode] | all(. == "none" or . == "dhcp" or . == "static"))
@@ -432,9 +499,7 @@ verify_payload() {
     mode=$(jq -r .payload.mode "$CONFIG")
     [[ $mode == offline ]] || return 0
     expected=$(jq -r .payload.rootfs_sha256 "$CONFIG")
-    archive=/opt/arch-redeploy/rootfs.tar.zst
-    [[ -r $archive ]] || archive="$RECOVERY_DIR/rootfs.tar.zst"
-    [[ -r $archive ]] || return 1
+    archive=$(offline_payload_archive) || return 1
     honor_cancellation
     [[ $(sha256sum "$archive" | awk '{print $1}') == "$expected" ]] || return 1
     honor_cancellation
@@ -548,7 +613,7 @@ create_partitions() {
 }
 
 install_recovery_boot() {
-    local disk=$1 mode=$2 install_id root_label recovery_label
+    local disk=$1 mode=$2 install_id root_label recovery_label archive
     install_id=$(jq -r .install_id "$CONFIG")
     root_label=$(target_root_label)
     install -d -m 0700 "$RECOVERY_DIR" "$RECOVERY_DIR/boot" "$RECOVERY_DIR/boot/grub"
@@ -556,8 +621,11 @@ install_recovery_boot() {
     install -m 0600 /run/recovery-initramfs.img "$RECOVERY_DIR/initramfs.img"
     printf '%s\n' "$install_id" >"$RECOVERY_DIR/install-id"
     chmod 0600 "$RECOVERY_DIR/install-id"
-    if [[ -r /opt/arch-redeploy/rootfs.tar.zst ]]; then
-        install -m 0600 /opt/arch-redeploy/rootfs.tar.zst "$RECOVERY_DIR/rootfs.tar.zst"
+    if [[ $(jq -r .payload.mode "$CONFIG") == offline ]]; then
+        archive=$(offline_payload_archive) || return 1
+        if [[ $archive != "$RECOVERY_DIR/rootfs.tar.zst" ]]; then
+            install -m 0600 "$archive" "$RECOVERY_DIR/rootfs.tar.zst"
+        fi
     fi
     cat >"$RECOVERY_DIR/boot/grub/grub.cfg" <<EOF
 set timeout=3
@@ -596,8 +664,8 @@ install_arch_root() {
     local -a package_files=()
     mode=$(jq -r .payload.mode "$CONFIG")
     if [[ $mode == offline ]]; then
-        local archive=/opt/arch-redeploy/rootfs.tar.zst
-        [[ -r $archive ]] || archive="$RECOVERY_DIR/rootfs.tar.zst"
+        local archive
+        archive=$(offline_payload_archive) || return 1
         tar --xattrs --acls --numeric-owner -I zstd -xpf "$archive" -C "$TARGET"
     else
         cache="$TARGET/var/cache/arch-redeploy"
@@ -727,6 +795,7 @@ main() {
     fi
 
     if ! $resuming && ! $partial; then
+        load_external_payload "$disk"
         honor_cancellation
     fi
     if ! $network_ready && { { ! $resuming && ! $partial; } || [[ $payload_mode == online ]]; }; then

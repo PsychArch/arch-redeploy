@@ -5,6 +5,8 @@ RA_TARGET_LOADED=1
 
 set -Eeuo pipefail
 
+readonly RA_KEY_ONLY_PASSWORD_HASH=x
+
 target_chroot() {
     local root=$1
     shift
@@ -147,8 +149,9 @@ EOF
         printf '%s\n' "$keys" >"$root$home/.ssh/authorized_keys" || return 1
         chmod 0600 "$root$home/.ssh/authorized_keys" || return 1
         chown -R "$(awk -F: -v user="$user" '$1 == user {print $3":"$4}' "$root/etc/passwd")" "$root$home/.ssh" || return 1
-        target_chroot "$root" usermod -p '!' "$user" || return 1
+        target_chroot "$root" usermod -p "$RA_KEY_ONLY_PASSWORD_HASH" "$user" || return 1
     elif [[ -n $password_hash ]]; then
+        rm -f "$root$home/.ssh/authorized_keys" || return 1
         target_chroot "$root" usermod -p "$password_hash" "$user" || return 1
     fi
 

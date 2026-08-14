@@ -127,7 +127,7 @@ unique matching serial or WWN, but ambiguity is fatal.
 
 ## Artifact and payload construction
 
-Preparation builds a self-contained Alpine recovery environment on the source
+Preparation builds a compact Alpine recovery environment on the source
 system. The Alpine minirootfs archive, checksum, and detached signature are
 downloaded from the selected release mirror and verified against the pinned
 official release key in [`assets/alpine-release-key.asc`](assets/alpine-release-key.asc).
@@ -141,10 +141,11 @@ The payload has two modes:
 ### Offline payload
 
 When staging space and the builder permit it, preparation installs and
-configures a complete Arch root in a temporary tree, archives it with metadata,
-checks the archive, and embeds it in the recovery image. Recovery verifies the
-archive hash before erasure. Package networking is then optional after the
-persistent recovery state exists.
+configures a complete Arch root in a temporary tree, and archives it with
+metadata. The archive is staged beside the recovery kernel and initramfs.
+Recovery mounts the source boot filesystem read-only, verifies the archive,
+copies it into RAM, and unmounts the source filesystem before erasure. Package
+networking is then optional after the persistent recovery state exists.
 
 ### Online fallback
 

@@ -516,7 +516,7 @@ ra_pack_initramfs() {
 ra_finalize_prepared_artifacts() {
     local artifacts="$RA_STATE_DIR/artifacts" manifest="$RA_STATE_DIR/artifacts/complete.json"
     local kernel="$RA_STATE_DIR/artifacts/vmlinuz" initramfs="$RA_STATE_DIR/artifacts/initramfs.img"
-    local rootfs="$RA_STATE_DIR/artifacts/rootfs.tar.zst" payload_mode
+    local rootfs="$RA_STATE_DIR/artifacts/rootfs.tar.zst" payload_mode rootfs_sha='' rootfs_bytes=0
     local prepared_at state
     [[ -s $manifest && -s $kernel && -s $initramfs ]] || return 1
     jq -e --arg install_id "$(ra_state_get .install_id)" '
@@ -534,6 +534,8 @@ ra_finalize_prepared_artifacts() {
         [[ $(jq -r '.rootfs_sha256 // empty' "$manifest") == "$(ra_state_get .payload.rootfs_sha256)" ]] || return 1
         [[ $(jq -r '.rootfs_bytes // 0' "$manifest") == "$(ra_bytes "$rootfs")" ]] || return 1
         [[ $(ra_sha256 "$rootfs") == "$(jq -r .rootfs_sha256 "$manifest")" ]] || return 1
+        rootfs_sha=$(jq -r .rootfs_sha256 "$manifest")
+        rootfs_bytes=$(jq -r .rootfs_bytes "$manifest")
     fi
     state=$(ra_state_get .state)
     if [[ $state == prepared ]]; then
@@ -562,8 +564,8 @@ ra_finalize_prepared_artifacts() {
         --argjson kernel_bytes "$(jq -r .kernel_bytes "$manifest")" \
         --arg initramfs_sha "$(jq -r .initramfs_sha256 "$manifest")" \
         --argjson initramfs_bytes "$(jq -r .initramfs_bytes "$manifest")" \
-        --arg rootfs_sha "$([[ $payload_mode == offline ]] && jq -r .rootfs_sha256 "$manifest" || true)" \
-        --argjson rootfs_bytes "$([[ $payload_mode == offline ]] && jq -r .rootfs_bytes "$manifest" || echo 0)" \
+        --arg rootfs_sha "$rootfs_sha" \
+        --argjson rootfs_bytes "$rootfs_bytes" \
         --arg prepared_at "$prepared_at"
 }
 
@@ -612,6 +614,7 @@ ra_disarm_build_cleanup() {
 
 ra_build_installer() {
     local work artifacts alpine_root packages_json payload_archive initramfs memory_bytes payload_mode=online
+    local rootfs_sha='' rootfs_bytes=0
     local required_bytes free_bytes disk_required_bytes
     ra_cleanup_stale_builds || ra_die "could not reclaim an interrupted installer build"
     work=$(ra_tempdir build)
@@ -717,14 +720,16 @@ ra_build_installer() {
     mv -f "$initramfs.kernel-package" "$artifacts/kernel-package"
     if [[ $payload_mode == offline ]]; then
         mv -f "$payload_archive" "$artifacts/rootfs.tar.zst"
+        rootfs_sha=$(ra_sha256 "$artifacts/rootfs.tar.zst")
+        rootfs_bytes=$(ra_bytes "$artifacts/rootfs.tar.zst")
     fi
     jq -n --arg install_id "$(ra_state_get .install_id)" \
         --arg kernel_sha "$(ra_sha256 "$artifacts/vmlinuz")" \
         --argjson kernel_bytes "$(ra_bytes "$artifacts/vmlinuz")" \
         --arg initramfs_sha "$(ra_sha256 "$artifacts/initramfs.img")" \
         --argjson initramfs_bytes "$(ra_bytes "$artifacts/initramfs.img")" \
-        --arg rootfs_sha "$([[ $payload_mode == offline ]] && ra_sha256 "$artifacts/rootfs.tar.zst" || true)" \
-        --argjson rootfs_bytes "$([[ $payload_mode == offline ]] && ra_bytes "$artifacts/rootfs.tar.zst" || echo 0)" \
+        --arg rootfs_sha "$rootfs_sha" \
+        --argjson rootfs_bytes "$rootfs_bytes" \
         --arg prepared_at "$(date -u +%FT%TZ)" '{
           install_id:$install_id,
           kernel_sha256:$kernel_sha,

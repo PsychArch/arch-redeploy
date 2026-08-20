@@ -22,7 +22,7 @@ hostname arch-redeploy
 depmod -a 2>/dev/null || true
 for module in virtio_pci virtio_blk virtio_scsi virtio_net nvme ahci ata_piix \
     xen_blkfront xen_netfront hv_storvsc hv_netvsc ena vmxnet3 e1000 e1000e \
-    ext4 vfat ipv6; do
+    btrfs ext4 xfs vfat ipv6; do
     modprobe "$module" 2>/dev/null || true
 done
 mdev -s

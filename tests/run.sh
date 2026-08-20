@@ -97,6 +97,13 @@ assert_eq "legacy prepared state maps to review" "review" "$(ra_progress_current
 
 assert_eq "boot RAM calculation includes duplicate image space and reserve" \
     "402653484" "$(ra_boot_memory_required 100 50)"
+assert_eq "boot RAM calculation reserves separately staged payload memory" \
+    "402654484" "$(ra_boot_memory_required 100 50 1000)"
+test_key_only_hash_is_unlocked() {
+    [[ $RA_KEY_ONLY_PASSWORD_HASH != '!'* && $RA_KEY_ONLY_PASSWORD_HASH != '*'* ]]
+}
+assert "key-only accounts remain unlocked for OpenSSH public-key authentication" \
+    test_key_only_hash_is_unlocked
 # shellcheck disable=SC2016 # positional parameters are expanded by the child shell.
 assert "online mode rejects one mirror" bash -c \
     'source "$1/lib/common.sh"; ! ra_online_mirror_count_valid '\''["https://one.example"]'\''' _ "$PROJECT_ROOT"
@@ -574,6 +581,42 @@ test_verified_artifact_commit_is_idempotent() (
 assert "verified preparation artifact commit is idempotent" \
     test_verified_artifact_commit_is_idempotent
 
+test_offline_artifact_commit_tracks_external_payload() (
+    local artifacts="$RA_STATE_DIR/artifacts" kernel_sha initramfs_sha rootfs_sha
+    mkdir -p "$artifacts"
+    printf 'kernel\n' >"$artifacts/vmlinuz"
+    printf 'initramfs\n' >"$artifacts/initramfs.img"
+    printf 'offline-root\n' >"$artifacts/rootfs.tar.zst"
+    kernel_sha=$(ra_sha256 "$artifacts/vmlinuz")
+    initramfs_sha=$(ra_sha256 "$artifacts/initramfs.img")
+    rootfs_sha=$(ra_sha256 "$artifacts/rootfs.tar.zst")
+    jq -n --arg rootfs_sha "$rootfs_sha" '{
+      state:"preparing",
+      install_id:"offline-artifact-test",
+      payload:{mode:"offline", rootfs_sha256:$rootfs_sha}
+    }' >"$RA_STATE_FILE"
+    jq -n --arg kernel_sha "$kernel_sha" --arg initramfs_sha "$initramfs_sha" \
+        --arg rootfs_sha "$rootfs_sha" \
+        --argjson kernel_bytes "$(ra_bytes "$artifacts/vmlinuz")" \
+        --argjson initramfs_bytes "$(ra_bytes "$artifacts/initramfs.img")" \
+        --argjson rootfs_bytes "$(ra_bytes "$artifacts/rootfs.tar.zst")" '{
+          install_id:"offline-artifact-test",
+          kernel_sha256:$kernel_sha,
+          kernel_bytes:$kernel_bytes,
+          initramfs_sha256:$initramfs_sha,
+          initramfs_bytes:$initramfs_bytes,
+          rootfs_sha256:$rootfs_sha,
+          rootfs_bytes:$rootfs_bytes,
+          prepared_at:"now"
+        }' >"$artifacts/complete.json"
+    ra_finalize_prepared_artifacts || return 1
+    ra_finalize_prepared_artifacts || return 1
+    [[ $(jq -r .artifacts.rootfs "$RA_STATE_FILE") == artifacts/rootfs.tar.zst ]] &&
+        [[ $(jq -r .artifacts.rootfs_sha256 "$RA_STATE_FILE") == "$rootfs_sha" ]]
+)
+assert "offline preparation commit tracks the separately staged payload" \
+    test_offline_artifact_commit_tracks_external_payload
+
 test_boot_artifact_staging_is_owned_and_idempotent() (
     local install_id=01234567-89ab-cdef-0123-456789abcdef
     local artifacts="$RA_STATE_DIR/artifacts" pending="${RA_BOOT_DIR}.pending-$install_id"
@@ -581,20 +624,50 @@ test_boot_artifact_staging_is_owned_and_idempotent() (
     mkdir -p "$artifacts"
     printf 'kernel\n' >"$artifacts/vmlinuz"
     printf 'initramfs\n' >"$artifacts/initramfs.img"
+    printf 'offline-root\n' >"$artifacts/rootfs.tar.zst"
     jq -n --arg install_id "$install_id" '{
       install_id:$install_id,
-      artifacts:{kernel:"artifacts/vmlinuz",initramfs:"artifacts/initramfs.img"}
+      payload:{mode:"offline"},
+      artifacts:{
+        kernel:"artifacts/vmlinuz",
+        initramfs:"artifacts/initramfs.img",
+        rootfs:"artifacts/rootfs.tar.zst"
+      }
     }' >"$RA_STATE_FILE"
     ra_verify_boot_capacity() { return 0; }
     ra_stage_boot_files || return 1
     ra_stage_boot_files || return 1
     [[ $(cat "$RA_BOOT_DIR/install-id") == "$install_id" ]] || return 1
+    cmp "$artifacts/rootfs.tar.zst" "$RA_BOOT_DIR/rootfs.tar.zst" || return 1
     mkdir -p "$pending"
     ra_remove_owned_boot_dir || return 1
     [[ ! -e $RA_BOOT_DIR && ! -e $pending ]]
 )
 assert "boot artifact staging and cleanup are install-ID-owned and idempotent" \
     test_boot_artifact_staging_is_owned_and_idempotent
+
+test_offline_payload_kernel_arguments() (
+    local args
+    mkdir -p "$RA_BOOT_DIR"
+    printf 'payload\n' >"$RA_BOOT_DIR/rootfs.tar.zst"
+    printf '%s\n' '{"payload":{"mode":"offline"}}' >"$RA_STATE_FILE"
+    findmnt() {
+        case $* in
+            *'-o TARGET') printf '%s\n' / ;;
+            *'-o FSROOT') printf '%s\n' /@ ;;
+            *'-o UUID') printf '%s\n' 11111111-2222-3333-4444-555555555555 ;;
+            *'-o FSTYPE') printf '%s\n' btrfs ;;
+            *) return 1 ;;
+        esac
+    }
+    args=$(ra_payload_kernel_args) || return 1
+    [[ $args == *'arch_redeploy_payload_uuid=11111111-2222-3333-4444-555555555555'* ]] &&
+        [[ $args == *'arch_redeploy_payload_fstype=btrfs'* ]] &&
+        [[ $args == *"arch_redeploy_payload_path=/@$RA_BOOT_DIR/rootfs.tar.zst"* ]] || return 1
+    rm -rf -- "$RA_BOOT_DIR"
+)
+assert "offline payload location is passed to recovery without entering initramfs" \
+    test_offline_payload_kernel_arguments
 
 stale_build="$RA_STATE_DIR/tmp/build.interrupted"
 mkdir -p "$stale_build/alpine"

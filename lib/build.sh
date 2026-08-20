@@ -424,6 +424,7 @@ ra_build_alpine_root() {
         util-linux util-linux-misc parted e2fsprogs e2fsprogs-extra dosfstools \
         grub grub-bios grub-efi efibootmgr arch-install-scripts archlinux-keyring \
         pacman zstd tar gzip cpio coreutils findutils grep gawk sed shadow sudo \
+        btrfs-progs xfsprogs \
         "$kernel_package" "${firmware_packages[@]}"
     ra_builder_chroot "$root" update-ca-certificates
     ra_extend_builder_ca_trust "$root"
@@ -492,17 +493,13 @@ ra_install_installer_sources() {
 }
 
 ra_pack_initramfs() {
-    local root=$1 output=$2 payload=${3:-} kernel kernel_package
+    local root=$1 output=$2 kernel kernel_package
     kernel_package=$(cat "$root/etc/arch-redeploy-kernel-package")
     kernel=$(find "$root/boot" -maxdepth 1 -type f -name "vmlinuz-*" | head -n1)
     [[ -s $kernel ]] || ra_die "Alpine kernel was not installed"
     cp "$kernel" "$output.kernel"
     install -Dm0644 "$kernel" "$root/opt/arch-redeploy/vmlinuz"
-    if [[ -n $payload ]]; then
-        install -Dm0600 "$payload" "$root/opt/arch-redeploy/rootfs.tar.zst"
-    else
-        rm -f "$root/opt/arch-redeploy/rootfs.tar.zst"
-    fi
+    rm -f "$root/opt/arch-redeploy/rootfs.tar.zst"
     ra_install_installer_sources "$root"
     ra_builder_chroot "$root" gpgconf --homedir /etc/pacman.d/gnupg --kill all 2>/dev/null || true
     find "$root/etc/pacman.d/gnupg" -type s -delete 2>/dev/null || true
@@ -514,12 +511,12 @@ ra_pack_initramfs() {
     )
     gzip -t "$output"
     printf '%s' "$kernel_package" >"$output.kernel-package"
-    rm -f "$root/opt/arch-redeploy/rootfs.tar.zst"
 }
 
 ra_finalize_prepared_artifacts() {
     local artifacts="$RA_STATE_DIR/artifacts" manifest="$RA_STATE_DIR/artifacts/complete.json"
     local kernel="$RA_STATE_DIR/artifacts/vmlinuz" initramfs="$RA_STATE_DIR/artifacts/initramfs.img"
+    local rootfs="$RA_STATE_DIR/artifacts/rootfs.tar.zst" payload_mode rootfs_sha='' rootfs_bytes=0
     local prepared_at state
     [[ -s $manifest && -s $kernel && -s $initramfs ]] || return 1
     jq -e --arg install_id "$(ra_state_get .install_id)" '
@@ -531,8 +528,23 @@ ra_finalize_prepared_artifacts() {
     [[ $(ra_sha256 "$initramfs") == "$(jq -r .initramfs_sha256 "$manifest")" ]] || return 1
     [[ $(ra_bytes "$kernel") == "$(jq -r .kernel_bytes "$manifest")" ]] || return 1
     [[ $(ra_bytes "$initramfs") == "$(jq -r .initramfs_bytes "$manifest")" ]] || return 1
+    payload_mode=$(jq -r '.payload.mode // "undecided"' "$RA_STATE_FILE")
+    if [[ $payload_mode == offline ]]; then
+        [[ -s $rootfs ]] || return 1
+        [[ $(jq -r '.rootfs_sha256 // empty' "$manifest") == "$(ra_state_get .payload.rootfs_sha256)" ]] || return 1
+        [[ $(jq -r '.rootfs_bytes // 0' "$manifest") == "$(ra_bytes "$rootfs")" ]] || return 1
+        [[ $(ra_sha256 "$rootfs") == "$(jq -r .rootfs_sha256 "$manifest")" ]] || return 1
+        rootfs_sha=$(jq -r .rootfs_sha256 "$manifest")
+        rootfs_bytes=$(jq -r .rootfs_bytes "$manifest")
+    fi
     state=$(ra_state_get .state)
-    [[ $state == prepared ]] && return 0
+    if [[ $state == prepared ]]; then
+        if [[ $payload_mode != offline ]] ||
+            [[ $(jq -r '.artifacts.rootfs_sha256 // empty' "$RA_STATE_FILE") == "$(jq -r .rootfs_sha256 "$manifest")" ]]; then
+            return 0
+        fi
+        return 1
+    fi
     ra_state_transition_allowed "$state" prepared || return 1
     prepared_at=$(jq -r .prepared_at "$manifest")
     # shellcheck disable=SC2016
@@ -543,11 +555,17 @@ ra_finalize_prepared_artifacts() {
         initramfs:"artifacts/initramfs.img",
         initramfs_sha256:$initramfs_sha,
         initramfs_bytes:$initramfs_bytes
-    } | .prepared_at = $prepared_at' \
+    } + (if $rootfs_sha == "" then {} else {
+        rootfs:"artifacts/rootfs.tar.zst",
+        rootfs_sha256:$rootfs_sha,
+        rootfs_bytes:$rootfs_bytes
+    } end) | .prepared_at = $prepared_at' \
         --arg kernel_sha "$(jq -r .kernel_sha256 "$manifest")" \
         --argjson kernel_bytes "$(jq -r .kernel_bytes "$manifest")" \
         --arg initramfs_sha "$(jq -r .initramfs_sha256 "$manifest")" \
         --argjson initramfs_bytes "$(jq -r .initramfs_bytes "$manifest")" \
+        --arg rootfs_sha "$rootfs_sha" \
+        --argjson rootfs_bytes "$rootfs_bytes" \
         --arg prepared_at "$prepared_at"
 }
 
@@ -596,13 +614,14 @@ ra_disarm_build_cleanup() {
 
 ra_build_installer() {
     local work artifacts alpine_root packages_json payload_archive initramfs memory_bytes payload_mode=online
+    local rootfs_sha='' rootfs_bytes=0
     local required_bytes free_bytes disk_required_bytes
     ra_cleanup_stale_builds || ra_die "could not reclaim an interrupted installer build"
     work=$(ra_tempdir build)
     artifacts="$RA_STATE_DIR/artifacts"
     mkdir -p "$artifacts"
     chmod 0700 "$artifacts"
-    rm -f "$artifacts/vmlinuz" "$artifacts/initramfs.img" "$artifacts/kernel-package" \
+    rm -f "$artifacts/vmlinuz" "$artifacts/initramfs.img" "$artifacts/rootfs.tar.zst" "$artifacts/kernel-package" \
         "$artifacts/complete.json"
     alpine_root="$work/alpine"
     payload_archive="$work/arch-root.tar.zst"
@@ -633,16 +652,17 @@ ra_build_installer() {
     fi
 
     if [[ $payload_mode == offline ]]; then
-        ra_pack_initramfs "$alpine_root" "$initramfs" "$payload_archive"
+        ra_pack_initramfs "$alpine_root" "$initramfs"
         memory_bytes=$(awk '/MemTotal:/ {print $2 * 1024}' /proc/meminfo)
-        required_bytes=$(ra_boot_memory_required "$(ra_bytes "$initramfs")" "$(ra_bytes "$initramfs.kernel")")
+        required_bytes=$(ra_boot_memory_required "$(ra_bytes "$initramfs")" \
+            "$(ra_bytes "$initramfs.kernel")" "$(ra_bytes "$payload_archive")")
         if ((memory_bytes < required_bytes)) ||
-            ! ra_boot_capacity_fits "$initramfs.kernel" "$initramfs"; then
+            ! ra_boot_capacity_fits "$initramfs.kernel" "$initramfs" "$payload_archive"; then
             if ((memory_bytes < required_bytes)); then
                 ra_warn "offline payload needs $(ra_human_bytes "$required_bytes") RAM; this host has $(ra_human_bytes "$memory_bytes")"
             fi
-            if ! ra_boot_capacity_fits "$initramfs.kernel" "$initramfs"; then
-                ra_warn "offline payload needs $(ra_human_bytes "$(ra_boot_capacity_required "$initramfs.kernel" "$initramfs")") free on the boot filesystem"
+            if ! ra_boot_capacity_fits "$initramfs.kernel" "$initramfs" "$payload_archive"; then
+                ra_warn "offline payload needs $(ra_human_bytes "$(ra_boot_capacity_required "$initramfs.kernel" "$initramfs" "$payload_archive")") free on the boot filesystem"
             fi
             ra_require_online_fallback "$alpine_root/etc/arch-redeploy/packages.lock"
             if ra_confirm "Use the explicitly riskier mirror-locked online mode?"; then
@@ -668,7 +688,12 @@ ra_build_installer() {
     fi
 
     memory_bytes=$(awk '/MemTotal:/ {print $2 * 1024}' /proc/meminfo)
-    required_bytes=$(ra_boot_memory_required "$(ra_bytes "$initramfs")" "$(ra_bytes "$initramfs.kernel")")
+    if [[ $payload_mode == offline ]]; then
+        required_bytes=$(ra_boot_memory_required "$(ra_bytes "$initramfs")" \
+            "$(ra_bytes "$initramfs.kernel")" "$(ra_bytes "$payload_archive")")
+    else
+        required_bytes=$(ra_boot_memory_required "$(ra_bytes "$initramfs")" "$(ra_bytes "$initramfs.kernel")")
+    fi
     ((memory_bytes >= required_bytes)) ||
         ra_die "the installer needs $(ra_human_bytes "$required_bytes") RAM; this host has $(ra_human_bytes "$memory_bytes")"
     # shellcheck disable=SC2016
@@ -683,23 +708,36 @@ ra_build_installer() {
         ra_die "the selected disk needs $(ra_human_bytes "$disk_required_bytes") for this prepared payload"
     # shellcheck disable=SC2016
     ra_state_update '.payload.disk_bytes_required = $bytes' --argjson bytes "$disk_required_bytes"
-    ra_verify_boot_capacity "$initramfs.kernel" "$initramfs"
+    if [[ $payload_mode == offline ]]; then
+        ra_verify_boot_capacity "$initramfs.kernel" "$initramfs" "$payload_archive"
+    else
+        ra_verify_boot_capacity "$initramfs.kernel" "$initramfs"
+    fi
 
     ra_unmount_builder_root "$alpine_root"
     mv -f "$initramfs" "$artifacts/initramfs.img"
     mv -f "$initramfs.kernel" "$artifacts/vmlinuz"
     mv -f "$initramfs.kernel-package" "$artifacts/kernel-package"
+    if [[ $payload_mode == offline ]]; then
+        mv -f "$payload_archive" "$artifacts/rootfs.tar.zst"
+        rootfs_sha=$(ra_sha256 "$artifacts/rootfs.tar.zst")
+        rootfs_bytes=$(ra_bytes "$artifacts/rootfs.tar.zst")
+    fi
     jq -n --arg install_id "$(ra_state_get .install_id)" \
         --arg kernel_sha "$(ra_sha256 "$artifacts/vmlinuz")" \
         --argjson kernel_bytes "$(ra_bytes "$artifacts/vmlinuz")" \
         --arg initramfs_sha "$(ra_sha256 "$artifacts/initramfs.img")" \
         --argjson initramfs_bytes "$(ra_bytes "$artifacts/initramfs.img")" \
+        --arg rootfs_sha "$rootfs_sha" \
+        --argjson rootfs_bytes "$rootfs_bytes" \
         --arg prepared_at "$(date -u +%FT%TZ)" '{
           install_id:$install_id,
           kernel_sha256:$kernel_sha,
           kernel_bytes:$kernel_bytes,
           initramfs_sha256:$initramfs_sha,
           initramfs_bytes:$initramfs_bytes,
+          rootfs_sha256:$rootfs_sha,
+          rootfs_bytes:$rootfs_bytes,
           prepared_at:$prepared_at
         }' | ra_atomic_json "$artifacts/complete.json"
     ra_finalize_prepared_artifacts ||

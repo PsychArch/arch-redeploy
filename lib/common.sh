@@ -95,8 +95,8 @@ ra_human_bytes() {
 }
 
 ra_boot_memory_required() {
-    local initramfs_bytes=$1 kernel_bytes=$2
-    printf '%s' "$((2 * (initramfs_bytes + kernel_bytes) + 384 * 1024 * 1024))"
+    local initramfs_bytes=$1 kernel_bytes=$2 payload_bytes=${3:-0}
+    printf '%s' "$((payload_bytes + 2 * (initramfs_bytes + kernel_bytes) + 384 * 1024 * 1024))"
 }
 
 ra_online_mirror_count_valid() {

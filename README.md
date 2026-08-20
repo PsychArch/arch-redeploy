@@ -99,6 +99,12 @@ key or password:
 ssh -p <port> root@<server-address>
 ```
 
+For an offline payload, the one-shot loader starts a compact Alpine image. The
+recovery environment mounts the still-intact source boot filesystem read-only,
+verifies the separately staged Arch root archive, and copies it into RAM before
+the erase boundary. Installation remains independent of the network after
+erasure without requiring firmware or GRUB to load the full archive.
+
 Use `arch-redeploy status` to show the current stage. Follow detailed progress
 with:
 
